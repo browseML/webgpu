@@ -46,6 +46,20 @@ controls that must fail.
 | f16 attention, RoPE, norms | the rest of a layer | next |
 | the forward pass | a GPU worker beside the engine, matmuls handed over through shared memory | next ([TODO](https://github.com/browseML/browseML/blob/main/docs/TODO.md)) |
 
+## Measured
+
+| where | shapes | result |
+|---|---|---|
+| `index.html`, headless Brave 152 (SwiftShader), 2026-10-13 | 256 × 2048 · 64 × 6144 · 512 × 128 | **256/256 · 64/64 · 512/512 bit-exact**; both controls differ, as they must |
+| browseML's control panel, **EXACT** (TOOL SUITE) | 256 × 2048 | **256/256 bit-exact**, 258–461 ms |
+
+**Used in browseML today:** the control panel's **EXACT** tool and its **GPU** slider (off · low power · high
+performance) run this kernel on the visitor's GPU and report the verdict. The answers are still written on the CPU.
+
+**What the GPU has to beat** (browseML v0.6.2, Ryzen 3 3200U, `browseml-mt-relaxed.wasm`, 4 threads): reading the
+prompt at 5.6 tok/s and writing at 3.4 tok/s ([efficiency](https://github.com/browseML/browseML/blob/main/docs/efficiency.md)).
+Reading the prompt is where a GPU would help most: many tokens at once reuse each weight row, which suits a GPU's batches.
+
 ## Run the test
 
 ```sh
