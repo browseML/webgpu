@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browseML — GPU exactness</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0f14; color: #e5e7eb; font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  p { color: #cbd5e1; }
+  button { min-height: 44px; padding: 0 18px; border-radius: 10px; border: 0; background: #0ECB81; color: #04140d; font-weight: 700; cursor: pointer; }
+  pre { white-space: pre-wrap; background: #111827; border: 1px solid #263241; border-radius: 10px; padding: 12px; font: 13px/1.5 ui-monospace, monospace; }
+  .ok { color: #0ECB81; } .bad { color: #F6465D; }
+</style>
+</head>
+<body>
+<main>
+  <h1>browseML on this GPU — exactness</h1>
+  <p>bankML's Q1_0 · q8_0 dot product as a WebGPU kernel, on random rows, every result's bits against bankML's own
+  reference (its WebAssembly module, the arithmetic every CPU path matches). Then two controls that must differ: the
+  same kernel with a plain multiply-add, and with WGSL's <code>fma()</code>. Nothing is sent anywhere.</p>
+  <button id="go">Run</button>
+  <pre id="out">—</pre>
+</main>
+<script type="module">
+import * as g from "./q1_0.js";
+const out = document.getElementById("out");
+const say = (t, c = "") => { out.innerHTML += `<span class="${c}">${t}</span>\n`; };
+document.getElementById("go").onclick = async () => {
+  out.textContent = "";
+  try {
+    for (const [rows, n, seed] of [[256, 2048, 1], [64, 6144, 2], [512, 128, 3]]) {
+      const x = await g.exact({ rows, n, seed });
+      say(`${rows} rows × ${n}: ${x.same}/${x.rows} bit-exact · GPU ${x.gpuMs.toFixed(0)} ms · ${x.adapter || "adapter unnamed"}`, x.same === x.rows ? "ok" : "bad");
+    }
+    // the controls: the same harness, the outer step without the exact FMA
+    const adapter = await navigator.gpu.requestAdapter(), device = await adapter.requestDevice();
+    const c = g.randomCase(256, 2048, 1), ref = await g.reference(new URL("./reference/browseml.wasm", location.href).href, new URL("./reference/browseml-wasi.js", location.href).href, c);
+    for (const [name, line] of [["plain d0·ab + acc", "acc[l] = d0 * abv[l] + acc[l];"], ["WGSL fma()", "acc[l] = fma(d0, abv[l], acc[l]);"]]) {
+      const code = g.Q1_DOT_WGSL.replace("acc[l] = fma_exact(d0, abv[l], acc[l]);", line);
+      const r = await g.gpuDot(device, c, code);
+      let same = 0; for (let i = 0; i < c.rows; i++) same += r.bits[i] === ref[i];
+      say(`control, ${name}: ${same}/${c.rows} identical${same < c.rows ? " (as expected: rounding twice)" : " (this GPU fuses: the exact path is still the one used)"}`);
+    }
+    device.destroy();
+  } catch (e) { say(String(e.message || e), "bad"); }
+};
+</script>
+</body>
+</html>
