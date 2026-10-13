@@ -43,8 +43,9 @@ controls that must fail.
 | kernel | what | status |
 |---|---|---|
 | [`q1_0.js`](q1_0.js) `Q1_DOT_WGSL` | Q1_0 weights · q8_0 activations (bankML `q1_0::vec_dot_ref`), one row per invocation | **bit-exact**: 832/832 rows over three shapes (Brave, SwiftShader); controls 110/256 |
+| [`q1_0.js`](q1_0.js) `Q1_MM_WGSL` | the fast kernel: eight lanes per row, a token dimension, the vendor's workgroup | **bit-exact** on AMD (Vega 3, Dawn); **bankML's own** as [`gpu/wgsl.rs`](https://github.com/cryptoAGI/bankml/blob/browseml/bankML/gpu/wgsl.rs) |
+| the forward pass | browseML's GPU worker serves bankML's GPU imports; the card computes a verified share of each 1-bit matrix | **in browseML 0.6.7** |
 | f16 attention, RoPE, norms | the rest of a layer | next |
-| the forward pass | a GPU worker beside the engine, matmuls handed over through shared memory | next ([TODO](https://github.com/browseML/browseML/blob/main/docs/TODO.md)) |
 
 ## Exact on AMD, and why it needed a fix
 
@@ -70,9 +71,16 @@ npm i webgpu   # Dawn for Node, in any directory
 DAWN=<that directory> node tests/gpu.mjs
 ```
 
-**In the engine:** bankML (branch `browseml`) now runs its GPU worker on WebGPU in a browser — the same on-card oracle and
-calibration as on Vulkan. Through browseML on the Vega 3 it passed the oracle, took a calibrated share of each 1-bit
-matrix's rows, and the answers stayed identical to llama.cpp's record.
+**In the engine (browseML 0.6.7, bankML `a32f81c`):** the fast kernel is now bankML's own (`gpu/wgsl.rs`, with
+`workgroup_for`). The engine hands the page's GPU worker the shader's text and the workgroup size, and browseML's
+test checks its copy is the same text. bankML's GPU worker runs on WebGPU with the same on-card oracle and
+calibration as on Vulkan. It also uses the token dimension to read prompts (`begin_many`) and submits Q/K/V and
+gate/up together with one wait (`begin_group`). Through browseML's bench on the Vega 3 (3 threads, alternating with
+the GPU off), reading went 5.05 → 5.41 and 5.10 → 5.60 tok/s, writing was unchanged, and 12 of 12 answers were
+identical to llama.cpp's record.
+
+**Changing a kernel:** change it in bankML first (`gpu/wgsl.rs`), then copy it to `q1_0.js` here and to browseML's
+`web/browseml-gpu.js`. browseML's `testing/gpu.mjs` fails until the texts match.
 
 ## Measured
 
@@ -81,8 +89,9 @@ matrix's rows, and the answers stayed identical to llama.cpp's record.
 | `index.html`, headless Brave 152 (SwiftShader), 2026-10-13 | 256 × 2048 · 64 × 6144 · 512 × 128 | **256/256 · 64/64 · 512/512 bit-exact**; both controls differ, as they must |
 | browseML's control panel, **EXACT** (TOOL SUITE) | 256 × 2048 | **256/256 bit-exact**, 258–461 ms |
 
-**Used in browseML today:** the control panel's **EXACT** tool and its **GPU** slider (off · low power · high
-performance) run this kernel on the visitor's GPU and report the verdict. The answers are still written on the CPU.
+**Used in browseML today:** the control panel's **EXACT** tool runs the kernel on the visitor's GPU and reports the
+verdict; the **GPU** switch (off · low power · high performance) starts bankML with or without the card. With it on,
+the card computes its verified share of every answer.
 
 **What the GPU has to beat** (browseML v0.6.2, Ryzen 3 3200U, `browseml-mt-relaxed.wasm`, 4 threads): reading the
 prompt at 5.6 tok/s and writing at 3.4 tok/s ([efficiency](https://github.com/browseML/browseML/blob/main/docs/efficiency.md)).
