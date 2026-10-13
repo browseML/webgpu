@@ -18,7 +18,7 @@
 export const Q1_0_BYTES = 18, Q8_0_BYTES = 34, QK1_0 = 128, QK8_0 = 32;
 
 export const Q1_DOT_WGSL = /* wgsl */ `
-struct P { n: u32, rows: u32 }
+struct P { n: u32, rows: u32, zero: u32, pad: u32 }
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> A: array<u32>;
 @group(0) @binding(2) var<storage, read_write> O: array<u32>;
@@ -40,12 +40,17 @@ fn f16(h: u32) -> f32 {
   return bitcast<f32>(sgn | ((e + 112u) << 23u) | (m << 13u));
 }
 
+// a value the compiler cannot see through: OR with a zero it only learns at run time (the uniform's \`zero\`). WGSL
+// cannot mark operations exact (SPIR-V's NoContraction); without this, a driver's float simplifier (Mesa's NIR on
+// AMD) may turn (a + b) − a into b and lose TwoSum's error term
+fn hide(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) | p.zero); }
+
 // Knuth's TwoSum: s = a + b rounded, and the exact error
 fn two_sum(a: f32, b: f32) -> vec2<f32> {
-  let s = a + b;
-  let bb = s - a;
-  let sb = s - bb;
-  return vec2<f32>(s, (a - sb) + (b - bb));
+  let s = hide(a + b);
+  let bb = hide(s - a);
+  let sb = hide(s - bb);
+  return vec2<f32>(s, hide(a - sb) + hide(b - bb));
 }
 
 // fma(a, b, c) correctly rounded, from plain operations; a carries at most 12 significant bits (an f16 does)
@@ -95,6 +100,150 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let h = ((acc[0] + acc[4]) + (acc[2] + acc[6])) + ((acc[1] + acc[5]) + (acc[3] + acc[7]));
   O[r] = bitcast<u32>(h);
 }`;
+
+/**
+ * The fast kernel, still exact: bankML's `q1_0_mat_vec8` in WGSL, with a second dimension for many activations (a
+ * prompt's tokens). Weights and activations repacked once (`packQ1`, `packQ8`): per weight block its scale as f32 and
+ * its 128 bits as four u32; per activation its scales as f32 and its i8 quants four to a word. Eight invocations per
+ * (row, activation), one per accumulation lane of the CPU kernel — chains independent there too — then lane 0 adds the
+ * eight in the CPU's order. `WG` (the workgroup size, a multiple of 8) follows the vendor: 64 for AMD's wavefronts,
+ * 32 for NVIDIA's warps (`workgroupFor`). Output: O[col · rows + row], the f32 bits of `vec_dot_ref`.
+ */
+export const Q1_MM_WGSL = /* wgsl */ `
+override WG: u32 = 64u;
+struct P { rows: u32, nb: u32, cols: u32, zero: u32 }
+@group(0) @binding(0) var<storage, read> Wd: array<f32>;
+@group(0) @binding(1) var<storage, read> Wb: array<u32>;
+@group(0) @binding(2) var<storage, read> Ad: array<f32>;
+@group(0) @binding(3) var<storage, read> Aq: array<u32>;
+@group(0) @binding(4) var<storage, read_write> O: array<f32>;
+@group(0) @binding(5) var<uniform> p: P;
+var<workgroup> part: array<f32, WG>;
+
+fn hide(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) | p.zero); }  // see Q1_DOT_WGSL's hide
+fn two_sum(a: f32, b: f32) -> vec2<f32> {
+  let s = hide(a + b);
+  let bb = hide(s - a);
+  let sb = hide(s - bb);
+  return vec2<f32>(s, hide(a - sb) + hide(b - bb));
+}
+fn fma_exact(a: f32, b: f32, c: f32) -> f32 {
+  let bhi = bitcast<f32>(bitcast<u32>(b) & 0xfffff000u);
+  let blo = b - bhi;
+  let u = two_sum(a * bhi, a * blo);
+  let t = two_sum(c, u.x);
+  let v = two_sum(t.y, u.y);
+  var vb = bitcast<u32>(v.x);
+  if ((vb & 1u) == 0u && v.y != 0.0) { vb = select(vb - 1u, vb + 1u, (v.x > 0.0) == (v.y > 0.0)); }
+  return t.x + bitcast<f32>(vb);
+}
+
+@compute @workgroup_size(WG)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let r = gid.x / 8u;
+  let l = gid.x % 8u;
+  let c = gid.y;
+  let live = r < p.rows && c < p.cols;
+  var acc = 0.0;
+  if (live) {
+    let nb = p.nb;
+    for (var i = 0u; i < nb; i++) {
+      let d0 = Wd[r * nb + i];
+      var ab = 0.0;
+      for (var k = 0u; k < 4u; k++) {
+        let b = i * 4u + k;
+        let d1 = Ad[c * nb * 4u + b];
+        let bits = (Wb[(r * nb + i) * 4u + k] >> (4u * l)) & 0xfu;
+        let qw = Aq[(c * nb * 4u + b) * 8u + l];
+        var s: i32 = 0;
+        for (var j = 0u; j < 4u; j++) {
+          let q = bitcast<i32>(qw << (24u - 8u * j)) >> 24u;
+          // the reference negates as an i8 (wrapping): -(-128) stays -128
+          let nq = select(-q, -128, q == -128);
+          s += select(nq, q, ((bits >> j) & 1u) == 1u);
+        }
+        let prod = d1 * f32(s);
+        ab = select(prod + ab, prod, k == 0u);
+      }
+      acc = fma_exact(d0, ab, acc);
+    }
+  }
+  part[lid.x] = acc;
+  workgroupBarrier();
+  if (live && l == 0u) {
+    let o = lid.x;
+    let h = ((part[o] + part[o + 4u]) + (part[o + 2u] + part[o + 6u])) + ((part[o + 1u] + part[o + 5u]) + (part[o + 3u] + part[o + 7u]));
+    O[c * p.rows + r] = h;
+  }
+}`;
+
+/** The workgroup size for this GPU: 64 for AMD (wavefronts of 64), 32 for NVIDIA (warps of 32), else its subgroup
+ *  size rounded up to a multiple of 8 (64 when unknown). */
+export function workgroupFor(info = {}) {
+  const v = String(info.vendor || '').toLowerCase();
+  if (v.includes('nvidia')) return 32;
+  if (v.includes('amd') || v.includes('ati')) return 64;
+  const sg = Number(info.subgroupMaxSize) || 0;
+  return sg >= 8 && sg <= 128 ? Math.ceil(sg / 8) * 8 : 64;
+}
+
+const f16f32 = (h) => {
+  const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+  if (e === 0) return s * m * 2 ** -24;
+  if (e === 31) return m ? NaN : s * Infinity;
+  return s * (1 + m / 1024) * 2 ** (e - 15);
+};
+/** Q1_0 rows repacked for the fast kernel: each block's scale as f32 (exact) and its bits as four u32. */
+export function packQ1(W, rows, n) {
+  const nb = n / QK1_0, d = new Float32Array(rows * nb), b = new Uint32Array(rows * nb * 4);
+  const dv = new DataView(W.buffer, W.byteOffset, W.byteLength);
+  for (let i = 0; i < rows * nb; i++) {
+    const o = i * Q1_0_BYTES;
+    d[i] = f16f32(dv.getUint16(o, true));
+    for (let k = 0; k < 4; k++) b[i * 4 + k] = dv.getUint32(o + 2 + 4 * k, true);
+  }
+  return { d, b, rows, n };
+}
+/** q8_0 activations (one or more, each n values) repacked: scales as f32, quants four to a u32. */
+export function packQ8(As, n) {
+  const nb32 = n / QK8_0, d = new Float32Array(As.length * nb32), q = new Uint32Array(As.length * nb32 * 8);
+  As.forEach((A, c) => {
+    const dv = new DataView(A.buffer, A.byteOffset, A.byteLength);
+    for (let b = 0; b < nb32; b++) {
+      d[c * nb32 + b] = f16f32(dv.getUint16(b * Q8_0_BYTES, true));
+      for (let w = 0; w < 8; w++) q[(c * nb32 + b) * 8 + w] = dv.getUint32(b * Q8_0_BYTES + 2 + 4 * w, true);
+    }
+  });
+  return { d, q, cols: As.length, n };
+}
+
+/** The fast kernel on `device`: a packed matrix times packed activations; O[col·rows + row] as f32 bits, and the time
+ *  from submit to the result in hand. `wg` from `workgroupFor`. Buffers are made and freed here (for tests and
+ *  timing); the engine keeps its weights resident instead. */
+export async function gpuMatMul(device, Wp, Ap, wg = 64) {
+  const U = globalThis.GPUBufferUsage, MAP = globalThis.GPUMapMode;
+  const { rows, n } = Wp, cols = Ap.cols, nb = n / QK1_0;
+  const buf = (data, usage) => { const b = device.createBuffer({ size: Math.max(16, data.byteLength), usage }); device.queue.writeBuffer(b, 0, data); return b; };
+  const bs = [buf(Wp.d, U.STORAGE | U.COPY_DST), buf(Wp.b, U.STORAGE | U.COPY_DST), buf(Ap.d, U.STORAGE | U.COPY_DST), buf(Ap.q, U.STORAGE | U.COPY_DST)];
+  const oB = device.createBuffer({ size: rows * cols * 4, usage: U.STORAGE | U.COPY_SRC });
+  const pB = buf(new Uint32Array([rows, nb, cols, 0]), U.UNIFORM | U.COPY_DST);
+  const rd = device.createBuffer({ size: rows * cols * 4, usage: U.MAP_READ | U.COPY_DST });
+  const module = device.createShaderModule({ code: Q1_MM_WGSL });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main', constants: { WG: wg } } });
+  const bind = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [...bs, oB, pB].map((buffer, binding) => ({ binding, resource: { buffer } })) });
+  await device.queue.onSubmittedWorkDone();  // uploads done: the time below is the product's
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass(); pass.setPipeline(pipeline); pass.setBindGroup(0, bind);
+  pass.dispatchWorkgroups(Math.ceil((rows * 8) / wg), cols); pass.end();
+  enc.copyBufferToBuffer(oB, 0, rd, 0, rows * cols * 4);
+  const t = performance.now();
+  device.queue.submit([enc.finish()]);
+  await rd.mapAsync(MAP.READ);
+  const ms = performance.now() - t;
+  const out = new Uint32Array(rd.getMappedRange().slice(0)); rd.unmap();
+  [...bs, oB, pB, rd].forEach((b) => b.destroy());
+  return { bits: out, ms };
+}
 
 /** A small reproducible generator (mulberry32). */
 function rng(seed) {

@@ -1,0 +1,5 @@
+{
+  "name": "browseml-webgpu",
+  "private": true,
+  "type": "module"
+}

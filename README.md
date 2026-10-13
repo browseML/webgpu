@@ -46,6 +46,34 @@ controls that must fail.
 | f16 attention, RoPE, norms | the rest of a layer | next |
 | the forward pass | a GPU worker beside the engine, matmuls handed over through shared memory | next ([TODO](https://github.com/browseML/browseML/blob/main/docs/TODO.md)) |
 
+## Exact on AMD, and why it needed a fix
+
+On a real AMD GPU the kernels were not exact at first: Mesa's shader compiler simplified TwoSum's `(a + b) − a` and lost
+its error term. SPIR-V can mark operations exact (NoContraction; bankML's Vulkan kernels do), WGSL cannot, and Chrome's
+compiler does not add it. Each intermediate now passes through an OR with a zero the compiler only learns at run time
+(`hide`), so it cannot simplify across it. Checked on an AMD Radeon Vega 3 (RADV) through Dawn, Chrome's WebGPU, in Node
+(`tests/gpu.mjs`): every result bit-exact, in every shape.
+
+## The fast kernel
+
+`Q1_MM_WGSL` is bankML's `q1_0_mat_vec8`: eight invocations per row, one per accumulation lane of the CPU kernel, the
+lanes added in the CPU's order; a second dimension takes many activations (a prompt's tokens). The workgroup follows the
+vendor (`workgroupFor`: 64 for AMD's wavefronts, 32 for NVIDIA's warps); 32, 64 and 128 give the same bits.
+
+| on the Vega 3 | 1 token | 16 tokens | 64 tokens |
+|---|---:|---:|---:|
+| 2048×2048 | 2.3 ms (simple kernel: 15 ms) | 9.6 ms | 18.7 ms (14.4 GMAC/s) |
+| 6144×2048 | 2.7 ms | 18.5 ms | 63.1 ms (12.8 GMAC/s) |
+
+```sh
+npm i webgpu   # Dawn for Node, in any directory
+DAWN=<that directory> node tests/gpu.mjs
+```
+
+**In the engine:** bankML (branch `browseml`) now runs its GPU worker on WebGPU in a browser — the same on-card oracle and
+calibration as on Vulkan. Through browseML on the Vega 3 it passed the oracle, took a calibrated share of each 1-bit
+matrix's rows, and the answers stayed identical to llama.cpp's record.
+
 ## Measured
 
 | where | shapes | result |
