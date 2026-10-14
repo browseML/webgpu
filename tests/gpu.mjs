@@ -54,14 +54,21 @@ for (const [rows, n, cols] of [[64, 128, 1], [257, 1024, 3], [512, 2048, 8], [96
   const runs = await Promise.all([32, 64, 128].map((s) => g.gpuMatMul(device, g.packQ1(c0.W, rows, n), g.packQ8(As, n), s)));
   check("workgroups of 32, 64 and 128: the same bits", runs.every((r) => r.bits.every((b, i) => b === runs[0].bits[i])));
 }
+// the tiled kernel (four tokens per invocation): the untiled kernel's bits, partial tiles included
+for (const cols of [1, 3, 5, 9, 16]) {
+  const rows = 257, n = 2048, c0 = g.randomCase(rows, n, 11), As = Array.from({ length: cols }, (_, i) => g.randomCase(1, n, 200 + i).A);
+  const Wp = g.packQ1(c0.W, rows, n), Ap = g.packQ8(As, n);
+  const a = await g.gpuMatMul(device, Wp, Ap, wg), b = await g.gpuMatMul(device, Wp, Ap, wg, true);
+  check(`tiled kernel ${rows}×${n} × ${cols}: the untiled kernel's bits`, a.bits.every((x, i) => x === b.bits[i]));
+}
 
 // speed on the model's shapes (Bonsai-1.7B: 2048 wide, 6144 in the FFN), best of 5 after a warm-up
-const time = async (rows, n, cols, kernel) => {
+const time = async (rows, n, cols, kernel) => {  // kernel: simple, fast or tiled
   const c0 = g.randomCase(rows, n, 3), As = Array.from({ length: cols }, (_, i) => g.randomCase(1, n, 50 + i).A);
   const Wp = g.packQ1(c0.W, rows, n), Ap = g.packQ8(As, n);
   let best = Infinity;
   for (let t = 0; t < 6; t++) {
-    const r = kernel === "simple" ? await g.gpuDot(device, { W: c0.W, A: As[0], rows, n }) : await g.gpuMatMul(device, Wp, Ap, wg);
+    const r = kernel === "simple" ? await g.gpuDot(device, { W: c0.W, A: As[0], rows, n }) : await g.gpuMatMul(device, Wp, Ap, wg, kernel === "tiled");
     if (t) best = Math.min(best, r.ms);
   }
   return best;
@@ -70,7 +77,8 @@ console.log("\nspeed (ms, submit to result in hand; weights already on the card 
 for (const [rows, n] of [[2048, 2048], [6144, 2048], [2048, 6144]]) {
   const s = await time(rows, n, 1, "simple"), f1 = await time(rows, n, 1, "fast"), f16 = await time(rows, n, 16, "fast"), f64 = await time(rows, n, 64, "fast");
   const gmac = (cols, ms) => ((rows * n * cols) / (ms / 1000) / 1e9).toFixed(1);
-  console.log(`  ${rows}×${n}: simple ${s.toFixed(2)} · fast 1 token ${f1.toFixed(2)} (${gmac(1, f1)} GMAC/s) · 16 tokens ${f16.toFixed(2)} (${gmac(16, f16)}) · 64 tokens ${f64.toFixed(2)} (${gmac(64, f64)})`);
+  const t64 = await time(rows, n, 64, "tiled");
+  console.log(`  ${rows}×${n}: simple ${s.toFixed(2)} · fast 1 token ${f1.toFixed(2)} (${gmac(1, f1)} GMAC/s) · 16 tokens ${f16.toFixed(2)} (${gmac(16, f16)}) · 64 tokens ${f64.toFixed(2)} (${gmac(64, f64)}) · tiled 64 tokens ${t64.toFixed(2)} (${gmac(64, t64)})`);
 }
 device.destroy();
 console.log(failed ? `\n${failed} check(s) failed` : "\nevery check passed");

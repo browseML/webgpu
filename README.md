@@ -44,6 +44,7 @@ controls that must fail.
 |---|---|---|
 | [`q1_0.js`](q1_0.js) `Q1_DOT_WGSL` | Q1_0 weights · q8_0 activations (bankML `q1_0::vec_dot_ref`), one row per invocation | **bit-exact**: 832/832 rows over three shapes (Brave, SwiftShader); controls 110/256 |
 | [`q1_0.js`](q1_0.js) `Q1_MM_WGSL` | the fast kernel: eight lanes per row, a token dimension, the vendor's workgroup | **bit-exact** on AMD (Vega 3, Dawn); **bankML's own** as [`gpu/wgsl.rs`](https://github.com/cryptoAGI/bankml/blob/browseml/bankML/gpu/wgsl.rs) |
+| [`q1_0.js`](q1_0.js) `Q1_MM4_WGSL` | the fast kernel with a token tile: four tokens per invocation, each weight word decoded once | **bit-exact** (the untiled kernel's bits, partial tiles included); **bankML's own** as `Q1_0_MM4`; reads prompts in browseML 0.6.10 |
 | the forward pass | browseML's GPU worker serves bankML's GPU imports; the card computes a verified share of each 1-bit matrix | **in browseML 0.6.7** |
 | f16 attention, RoPE, norms | the rest of a layer | next |
 
@@ -82,6 +83,13 @@ reading 6.70–7.53 → 7.30–7.74 tok/s and writing 2.88–3.34 → 3.14–3.4
 
 **Back to the server:** the same two lessons, a token dimension and several submissions in flight, are now in bankML's
 Vulkan backend too (`q1_0_mat_mul8`, `Gpu::IN_FLIGHT`), bit-exact on the Vega 3.
+
+**A token tile (browseML 0.6.10, bankML `8f5e930`):** `Q1_MM4_WGSL` is the fast kernel with four tokens per
+invocation: each weight word is read and decoded once for all four, and every token's chain is unchanged, so the bits
+are the untiled kernel's (checked at 1, 3, 5, 9 and 16 tokens). Past the last token an invocation computes a copy of it
+and never stores it, so there is no branch inside the chain. On the Vega 3 (Dawn, interleaved medians over five rounds)
+it was 1.14–1.18× the untiled kernel at 64–512 tokens and slower at 2, so bankML uses it only to read prompts of four
+or more tokens. Tiles of 8 and 16 lost on short prompts; guarding the unused columns cost more than it saved.
 
 **Changing a kernel:** change it in bankML first (`gpu/wgsl.rs`), then copy it to `q1_0.js` here and to browseML's
 `web/browseml-gpu.js`. browseML's `testing/gpu.mjs` fails until the texts match.

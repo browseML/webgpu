@@ -177,6 +177,89 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
   }
 }`;
 
+/** bankML's tiled kernel (gpu/wgsl.rs `Q1_0_MM4`): Q1_MM_WGSL with four tokens per invocation, each weight word
+ *  decoded once for all four; every token's chain unchanged, so the same bits. Dispatch y = ceil(columns / 4). The
+ *  engine reads prompts with it; browseML's testing/gpu.mjs checks this text against the engine's, tests/gpu.mjs
+ *  its bits against the untiled kernel's. */
+export const Q1_MM4_TILE = 4;
+export const Q1_MM4_WGSL = /* wgsl */ `
+override WG: u32 = 64u;
+struct P { rows: u32, nb: u32, cols: u32, zero: u32 }
+@group(0) @binding(0) var<storage, read> Wd: array<f32>;
+@group(0) @binding(1) var<storage, read> Wb: array<u32>;
+@group(0) @binding(2) var<storage, read> Ad: array<f32>;
+@group(0) @binding(3) var<storage, read> Aq: array<u32>;
+@group(0) @binding(4) var<storage, read_write> O: array<f32>;
+@group(0) @binding(5) var<uniform> p: P;
+const T: u32 = 4u;
+var<workgroup> part: array<f32, 4u * WG>;
+
+fn hide(x: f32) -> f32 { return bitcast<f32>(bitcast<u32>(x) | p.zero); }  // see Q1_DOT_WGSL's hide
+fn two_sum(a: f32, b: f32) -> vec2<f32> {
+  let s = hide(a + b);
+  let bb = hide(s - a);
+  let sb = hide(s - bb);
+  return vec2<f32>(s, hide(a - sb) + hide(b - bb));
+}
+fn fma_exact(a: f32, b: f32, c: f32) -> f32 {
+  let bhi = bitcast<f32>(bitcast<u32>(b) & 0xfffff000u);
+  let blo = b - bhi;
+  let u = two_sum(a * bhi, a * blo);
+  let t = two_sum(c, u.x);
+  let v = two_sum(t.y, u.y);
+  var vb = bitcast<u32>(v.x);
+  if ((vb & 1u) == 0u && v.y != 0.0) { vb = select(vb - 1u, vb + 1u, (v.x > 0.0) == (v.y > 0.0)); }
+  return t.x + bitcast<f32>(vb);
+}
+
+@compute @workgroup_size(WG)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let r = gid.x / 8u;
+  let l = gid.x % 8u;
+  let c0 = gid.y * T;
+  var acc: array<f32, 4>;
+  for (var t = 0u; t < T; t++) { acc[t] = 0.0; }
+  if (r < p.rows) {
+    let nb = p.nb;
+    for (var i = 0u; i < nb; i++) {
+      let d0 = Wd[r * nb + i];
+      var ab: array<f32, 4>;
+      for (var k = 0u; k < 4u; k++) {
+        let b = i * 4u + k;
+        // the weight word decoded once for T tokens; each token's chain is the untiled kernel's
+        let bits = (Wb[(r * nb + i) * 4u + k] >> (4u * l)) & 0xfu;
+        for (var t = 0u; t < T; t++) {
+          // past the last token: a copy of it, computed and never stored (no branch inside the chain)
+          let c = min(c0 + t, p.cols - 1u);
+          let d1 = Ad[c * nb * 4u + b];
+          let qw = Aq[(c * nb * 4u + b) * 8u + l];
+          var s: i32 = 0;
+          for (var j = 0u; j < 4u; j++) {
+            let q = bitcast<i32>(qw << (24u - 8u * j)) >> 24u;
+            let nq = select(-q, -128, q == -128);
+            s += select(nq, q, ((bits >> j) & 1u) == 1u);
+          }
+          let prod = d1 * f32(s);
+          ab[t] = select(prod + ab[t], prod, k == 0u);
+        }
+      }
+      for (var t = 0u; t < T; t++) { acc[t] = fma_exact(d0, ab[t], acc[t]); }
+    }
+  }
+  for (var t = 0u; t < T; t++) { part[t * WG + lid.x] = acc[t]; }
+  workgroupBarrier();
+  if (r < p.rows && l == 0u) {
+    for (var t = 0u; t < T; t++) {
+      let c = c0 + t;
+      if (c < p.cols) {
+        let o = t * WG + lid.x;
+        let h = ((part[o] + part[o + 4u]) + (part[o + 2u] + part[o + 6u])) + ((part[o + 1u] + part[o + 5u]) + (part[o + 3u] + part[o + 7u]));
+        O[c * p.rows + r] = h;
+      }
+    }
+  }
+}`;
+
 /** The workgroup size for this GPU: 64 for AMD (wavefronts of 64), 32 for NVIDIA (warps of 32), else its subgroup
  *  size rounded up to a multiple of 8 (64 when unknown). */
 export function workgroupFor(info = {}) {
@@ -219,8 +302,8 @@ export function packQ8(As, n) {
 
 /** The fast kernel on `device`: a packed matrix times packed activations; O[col·rows + row] as f32 bits, and the time
  *  from submit to the result in hand. `wg` from `workgroupFor`. Buffers are made and freed here (for tests and
- *  timing); the engine keeps its weights resident instead. */
-export async function gpuMatMul(device, Wp, Ap, wg = 64) {
+ *  timing); the engine keeps its weights resident instead. `tiled`: Q1_MM4_WGSL (how the engine reads prompts). */
+export async function gpuMatMul(device, Wp, Ap, wg = 64, tiled = false) {
   const U = globalThis.GPUBufferUsage, MAP = globalThis.GPUMapMode;
   const { rows, n } = Wp, cols = Ap.cols, nb = n / QK1_0;
   const buf = (data, usage) => { const b = device.createBuffer({ size: Math.max(16, data.byteLength), usage }); device.queue.writeBuffer(b, 0, data); return b; };
@@ -228,13 +311,13 @@ export async function gpuMatMul(device, Wp, Ap, wg = 64) {
   const oB = device.createBuffer({ size: rows * cols * 4, usage: U.STORAGE | U.COPY_SRC });
   const pB = buf(new Uint32Array([rows, nb, cols, 0]), U.UNIFORM | U.COPY_DST);
   const rd = device.createBuffer({ size: rows * cols * 4, usage: U.MAP_READ | U.COPY_DST });
-  const module = device.createShaderModule({ code: Q1_MM_WGSL });
+  const module = device.createShaderModule({ code: tiled ? Q1_MM4_WGSL : Q1_MM_WGSL });
   const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main', constants: { WG: wg } } });
   const bind = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [...bs, oB, pB].map((buffer, binding) => ({ binding, resource: { buffer } })) });
   await device.queue.onSubmittedWorkDone();  // uploads done: the time below is the product's
   const enc = device.createCommandEncoder();
   const pass = enc.beginComputePass(); pass.setPipeline(pipeline); pass.setBindGroup(0, bind);
-  pass.dispatchWorkgroups(Math.ceil((rows * 8) / wg), cols); pass.end();
+  pass.dispatchWorkgroups(Math.ceil((rows * 8) / wg), tiled ? Math.ceil(cols / Q1_MM4_TILE) : cols); pass.end();
   enc.copyBufferToBuffer(oB, 0, rd, 0, rows * cols * 4);
   const t = performance.now();
   device.queue.submit([enc.finish()]);
