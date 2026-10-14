@@ -99,6 +99,7 @@ or more tokens. Tiles of 8 and 16 lost on short prompts; guarding the unused col
 | where | shapes | result |
 |---|---|---|
 | `index.html`, headless Brave 152 (SwiftShader), 2026-10-13 | 256 × 2048 · 64 × 6144 · 512 × 128 | **256/256 · 64/64 · 512/512 bit-exact**; both controls differ, as they must |
+| `index.html`, headless Brave (SwiftShader), 2026-10-14: the engine's kernels too, five tokens each | the same three shapes | fast **1280/1280 · 320/320 · 2560/2560**, tiled the same; simple 256/256 · 64/64 · 512/512; both controls differ |
 | browseML's control panel, **EXACT** (TOOL SUITE) | 256 × 2048 | **256/256 bit-exact**, 258–461 ms |
 
 **Used in browseML today:** the control panel's **EXACT** tool runs the kernel on the visitor's GPU and reports the

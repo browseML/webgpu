@@ -21,8 +21,10 @@
 <main>
   <h1>browseML on this GPU — exactness</h1>
   <p>bankML's Q1_0 · q8_0 dot product as a WebGPU kernel, on random rows, every result's bits against bankML's own
-  reference (its WebAssembly module, the arithmetic every CPU path matches). Then two controls that must differ: the
-  same kernel with a plain multiply-add, and with WGSL's <code>fma()</code>. Nothing is sent anywhere.</p>
+  reference (its WebAssembly module, the arithmetic every CPU path matches) — the simple kernel, then the two the
+  engine uses: the fast one (eight lanes per row) and the tiled one (four tokens per invocation), on five tokens each.
+  Then two controls that must differ: the simple kernel with a plain multiply-add, and with WGSL's <code>fma()</code>.
+  Nothing is sent anywhere.</p>
   <button id="go">Run</button>
   <pre id="out">—</pre>
 </main>
@@ -36,6 +38,8 @@ document.getElementById("go").onclick = async () => {
     for (const [rows, n, seed] of [[256, 2048, 1], [64, 6144, 2], [512, 128, 3]]) {
       const x = await g.exact({ rows, n, seed });
       say(`${rows} rows × ${n}: ${x.same}/${x.rows} bit-exact · GPU ${x.gpuMs.toFixed(0)} ms · ${x.adapter || "adapter unnamed"}`, x.same === x.rows ? "ok" : "bad");
+      const all = x.rows * x.cols;
+      say(`  the fast kernel, ${x.cols} tokens: ${x.fastSame}/${all} bit-exact · the tiled kernel: ${x.tiledSame}/${all} (workgroup ${x.wg})`, x.fastSame === all && x.tiledSame === all ? "ok" : "bad");
     }
     // the controls: the same harness, the outer step without the exact FMA
     const adapter = await navigator.gpu.requestAdapter(), device = await adapter.requestDevice();
