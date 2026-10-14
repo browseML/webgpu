@@ -77,7 +77,11 @@ test checks its copy is the same text. bankML's GPU worker runs on WebGPU with t
 calibration as on Vulkan. It also uses the token dimension to read prompts (`begin_many`) and submits Q/K/V and
 gate/up together with one wait (`begin_group`). Through browseML's bench on the Vega 3 (3 threads, alternating with
 the GPU off), reading went 5.05 → 5.41 and 5.10 → 5.60 tok/s, writing was unchanged, and 12 of 12 answers were
-identical to llama.cpp's record.
+identical to llama.cpp's record. Measured again on a quiet machine (browseML 0.6.8, load 2–5, no browser open):
+reading 6.70–7.53 → 7.30–7.74 tok/s and writing 2.88–3.34 → 3.14–3.41 tok/s with the GPU on, 12 of 12 identical.
+
+**Back to the server:** the same two lessons, a token dimension and several submissions in flight, are now in bankML's
+Vulkan backend too (`q1_0_mat_mul8`, `Gpu::IN_FLIGHT`), bit-exact on the Vega 3.
 
 **Changing a kernel:** change it in bankML first (`gpu/wgsl.rs`), then copy it to `q1_0.js` here and to browseML's
 `web/browseml-gpu.js`. browseML's `testing/gpu.mjs` fails until the texts match.
